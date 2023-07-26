@@ -5,10 +5,13 @@ import (
 	"reflect"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubectl/pkg/util/podutils"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -20,6 +23,7 @@ import (
 	hubv1beta1 "github.com/kubernetes-sigs/kernel-module-management/api-hub/v1beta1"
 	kmmv1beta1 "github.com/kubernetes-sigs/kernel-module-management/api/v1beta1"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/constants"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/nmc"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/utils"
 )
 
@@ -31,6 +35,10 @@ func HasLabel(label string) predicate.Predicate {
 
 var skipDeletions predicate.Predicate = predicate.Funcs{
 	DeleteFunc: func(_ event.DeleteEvent) bool { return false },
+}
+
+var skipCreations predicate.Predicate = predicate.Funcs{
+	CreateFunc: func(_ event.CreateEvent) bool { return false },
 }
 
 var nodeBecomesReady predicate.Predicate = predicate.Funcs{
@@ -85,11 +93,12 @@ func clusterClaim(name string, clusterClaims []clusterv1.ManagedClusterClaim) *c
 }
 
 type Filter struct {
-	client client.Client
+	client    client.Client
+	nmcHelper nmc.Helper
 }
 
-func New(client client.Client) *Filter {
-	return &Filter{client: client}
+func New(client client.Client, nmcHelper nmc.Helper) *Filter {
+	return &Filter{client: client, nmcHelper: nmcHelper}
 }
 
 func (f *Filter) ModuleReconcilerNodePredicate(kernelLabel string) predicate.Predicate {
@@ -323,4 +332,131 @@ func getNodeReadyCondition(node *v1.Node) v1.ConditionStatus {
 		}
 	}
 	return v1.ConditionUnknown
+}
+
+func NMCReconcilerNodePredicate() predicate.Predicate {
+	return predicate.And(
+		skipDeletions,
+		predicate.Or(nodeBecomesReady, predicate.LabelChangedPredicate{}),
+	)
+}
+
+func (f *Filter) FindModulesForNMCNodeChange(ctx context.Context, node client.Object) []reconcile.Request {
+	logger := ctrl.LoggerFrom(ctx).WithValues("node", node.GetName())
+
+	reqs := make([]reconcile.Request, 0)
+
+	logger.Info("Listing all modules")
+
+	mods := kmmv1beta1.ModuleList{}
+
+	err := f.client.List(context.Background(), &mods)
+	if err != nil {
+		logger.Error(err, "could not list modules")
+		return reqs
+	}
+
+	logger.Info("Listed modules", "count", len(mods.Items))
+
+	reqSet := sets.New[types.NamespacedName]()
+
+	nodeLabelsSet := labels.Set(node.GetLabels())
+
+	for _, mod := range mods.Items {
+		logger := logger.WithValues("module name", mod.Name)
+
+		logger.V(1).Info("Processing module")
+
+		sel := labels.NewSelector()
+
+		for k, v := range mod.Spec.Selector {
+			logger.V(1).Info("Processing selector item", "key", k, "value", v)
+
+			requirement, err := labels.NewRequirement(k, selection.Equals, []string{v})
+			if err != nil {
+				logger.Error(err, "could not generate requirement")
+				return reqs
+			}
+
+			sel = sel.Add(*requirement)
+		}
+
+		if !sel.Matches(nodeLabelsSet) {
+			logger.V(1).Info("Node labels do not match the module's selector; skipping")
+			continue
+		}
+
+		nsn := types.NamespacedName{Name: mod.Name, Namespace: mod.Namespace}
+
+		reqs = append(reqs, reconcile.Request{NamespacedName: nsn})
+		reqSet.Insert(nsn)
+	}
+
+	nms, err := f.nmcHelper.Get(ctx, node.GetName())
+	if err != nil || nms == nil {
+		return reqs
+	}
+
+	// go over modules of NodeModulesConfig and add them to request if they are not there already
+	for _, mod := range nms.Spec.Modules {
+		nsn := types.NamespacedName{Name: mod.Name, Namespace: mod.Namespace}
+		if reqSet.Has(nsn) {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{NamespacedName: nsn})
+	}
+
+	logger.Info("Adding reconciliation requests", "count", len(reqs))
+	logger.V(1).Info("New requests", "requests", reqs)
+
+	return reqs
+}
+
+var moduleJobSuccess predicate.Predicate = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		job, ok := e.ObjectNew.(*batchv1.Job)
+		if !ok {
+			return true
+		}
+		owner := metav1.GetControllerOfNoCopy(job)
+		if owner != nil && owner.Kind == "Module" && job.Status.Succeeded == 1 {
+			return true
+		}
+
+		return false
+	},
+}
+
+func NMCReconcileJobPredicate() predicate.Predicate {
+	return predicate.And(
+		skipDeletions,
+		skipCreations,
+		moduleJobSuccess,
+	)
+}
+
+func (f *Filter) FindModuleForJobs(ctx context.Context, job client.Object) []reconcile.Request {
+        logger := ctrl.LoggerFrom(ctx).WithValues("node", job.GetName())
+
+        reqs := make([]reconcile.Request, 0)
+
+        logger.Info("Listing all modules")
+
+        mods := kmmv1beta1.ModuleList{}
+
+        err := f.client.List(context.Background(), &mods)
+        if err != nil {
+                logger.Error(err, "could not list modules")
+                return reqs
+        }
+
+        logger.Info("Listed modules", "count", len(mods.Items))
+
+        for _, mod := range mods.Items {
+                if metav1.IsControlledBy(job, &mod) {
+                        req := reconcile.Request{NamespacedName: types.NamespacedName{Name: mod.Name, Namespace: mod.Namespace}}
+                        return []reconcile.Request{req}
+                }
+        }
+        return nil
 }
